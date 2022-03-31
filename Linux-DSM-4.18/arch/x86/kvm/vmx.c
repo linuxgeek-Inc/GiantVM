@@ -7474,6 +7474,8 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	unsigned long exit_qualification;
 	gpa_t gpa;
 	u64 error_code;
+	int i;
+	unsigned long regs[NR_VCPU_REGS];
 
 	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
 
@@ -7488,8 +7490,11 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 			(exit_qualification & INTR_INFO_UNBLOCK_NMI))
 		vmcs_set_bits(GUEST_INTERRUPTIBILITY_INFO, GUEST_INTR_STATE_NMI);
 
+	for (i = VCPU_REGS_RAX; i < NR_VCPU_REGS; i++)
+		regs[i] = kvm_register_read(vcpu, i);
+
 	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
-	trace_kvm_page_fault(gpa, exit_qualification);
+	trace_kvm_page_fault(gpa, exit_qualification, regs);
 
 	/* Is it a read fault? */
 	error_code = (exit_qualification & EPT_VIOLATION_ACC_READ)

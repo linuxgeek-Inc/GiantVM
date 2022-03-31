@@ -3,6 +3,7 @@
 #define _TRACE_KVM_H
 
 #include <linux/tracepoint.h>
+#include <linux/kvm_host.h>
 #include <asm/vmx.h>
 #include <asm/svm.h>
 #include <asm/clocksource.h>
@@ -303,21 +304,49 @@ TRACE_EVENT(kvm_inj_exception,
  * Tracepoint for page fault.
  */
 TRACE_EVENT(kvm_page_fault,
-	TP_PROTO(unsigned long fault_address, unsigned int error_code),
-	TP_ARGS(fault_address, error_code),
+	TP_PROTO(unsigned long fault_address, unsigned int error_code, unsigned long *regs),
+	TP_ARGS(fault_address, error_code, regs),
 
 	TP_STRUCT__entry(
 		__field(	unsigned long,	fault_address	)
 		__field(	unsigned int,	error_code	)
+		__array(	unsigned long,	regs,	NR_VCPU_REGS    )
 	),
 
 	TP_fast_assign(
 		__entry->fault_address	= fault_address;
 		__entry->error_code	= error_code;
+		memcpy(__entry->regs, regs, sizeof(unsigned long)*NR_VCPU_REGS)
 	),
-
-	TP_printk("address %lx error_code %x",
-		  __entry->fault_address, __entry->error_code)
+#ifdef CONFIG_X86_64
+	TP_printk("address %lx error_code %x "\
+			"rax %lx rcx %lx rdx %lx rbx %lx "\
+			"rsp %lx rbp %lx rsi %lx rdi %lx "\
+			"r8 %lx r9 %lx r10 %lx r11 %lx "\
+			"r12 %lx r13 %lx r14 %lx r15 %lx "\
+			"rip %lx",
+		  __entry->fault_address, __entry->error_code,
+		  __entry->regs[VCPU_REGS_RAX], __entry->regs[VCPU_REGS_RCX],
+		  __entry->regs[VCPU_REGS_RDX], __entry->regs[VCPU_REGS_RBX],
+		  __entry->regs[VCPU_REGS_RSP], __entry->regs[VCPU_REGS_RBP],
+		  __entry->regs[VCPU_REGS_RSI], __entry->regs[VCPU_REGS_RDI],
+		  __entry->regs[VCPU_REGS_R8], __entry->regs[VCPU_REGS_R9],
+		  __entry->regs[VCPU_REGS_R10], __entry->regs[VCPU_REGS_R11],
+		  __entry->regs[VCPU_REGS_R12], __entry->regs[VCPU_REGS_R13],
+		  __entry->regs[VCPU_REGS_R14], __entry->regs[VCPU_REGS_R15],
+		  __entry->regs[VCPU_REGS_RIP])
+#else
+	TP_printk("address %lx error_code %x "\
+			"eax %lx ecx %lx edx %lx ebx %lx "\
+			"esp %lx ebp %lx esi %lx edi %lx "\
+			"eip %lx",
+		  __entry->fault_address, __entry->error_code,
+		  __entry->regs[VCPU_REGS_RAX], __entry->regs[VCPU_REGS_RCX],
+		  __entry->regs[VCPU_REGS_RDX], __entry->regs[VCPU_REGS_RBX],
+		  __entry->regs[VCPU_REGS_RSP], __entry->regs[VCPU_REGS_RBP],
+		  __entry->regs[VCPU_REGS_RSI], __entry->regs[VCPU_REGS_RDI],
+		  __entry->regs[VCPU_REGS_RIP])
+#endif
 );
 
 /*
