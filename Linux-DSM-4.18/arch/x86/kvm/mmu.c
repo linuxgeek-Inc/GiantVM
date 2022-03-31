@@ -3995,11 +3995,15 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
 				u64 fault_address, char *insn, int insn_len)
 {
 	int r = 1;
+	int i;
+	unsigned long regs[NR_VCPU_REGS];
 
 	vcpu->arch.l1tf_flush_l1d = true;
 	switch (vcpu->arch.apf.host_apf_reason) {
 	default:
-		trace_kvm_page_fault(fault_address, error_code);
+		for (i = VCPU_REGS_RAX; i < NR_VCPU_REGS; i++)
+			regs[i] = kvm_register_read(vcpu, i);
+		trace_kvm_page_fault(fault_address, error_code, regs);
 
 		if (kvm_event_needs_reinjection(vcpu))
 			kvm_mmu_unprotect_page_virt(vcpu, fault_address);
