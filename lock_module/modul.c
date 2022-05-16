@@ -22,7 +22,7 @@ MODULE_DESCRIPTION("Simple Lock benchmark module");
 MODULE_AUTHOR("Wonhyuk Yang");
 MODULE_LICENSE("GPL");
 
-#define DEBUG
+//#define DEBUG
 #define NR_BENCH (500000)
 
 #define MAX_COMBINER_OPERATIONS 5
@@ -448,8 +448,9 @@ static int t_show(struct seq_file *m, void *v)
 						node[0].wait, node[0].completed,
 						node[0].refcount.counter,
 						DECODE_CPU(node[0].next),
-						DECODE_IDX(node[0].next),
+						DECODE_IDX(node[0].next)
 #ifdef DEBUG
+						,
 						DECODE_CPU(node[0].prev),
 						DECODE_IDX(node[0].prev)
 #endif
@@ -470,8 +471,9 @@ static int t_show(struct seq_file *m, void *v)
 						node[1].wait, node[1].completed,
 						node[1].refcount.counter,
 						DECODE_CPU(node[1].next),
-						DECODE_IDX(node[1].next),
+						DECODE_IDX(node[1].next)
 #ifdef DEBUG
+						,
 						DECODE_CPU(node[1].prev),
 						DECODE_IDX(node[1].prev)
 #endif
@@ -675,16 +677,20 @@ static int dump_cclock(void)
 	int cpu, idx;
 	struct cc_node *node;
 	struct lb_info *ld;
+#ifdef DEBUG
 	int tmp;
+#endif
 
 	pr_err("<Node_array information>\n");
 	pr_err("dummy_lock: (%d, %d)\n",
 					DECODE_CPU(dummy_lock.counter), DECODE_IDX(dummy_lock.counter));
+#ifdef DEBUG
 	pr_err("last used node:\n");
 	for (idx=6; idx>0; idx--){
 		tmp = node_trace[(node_trace_idx + (MAX_CPU*2) - (idx)) % (MAX_CPU*2)];
 		pr_err("(%d,%d)->", DECODE_CPU(tmp), DECODE_IDX(tmp));
 	}
+#endif
 	for_each_online_cpu(cpu) {
 		node = per_cpu(node_array, cpu);
 		idx = per_cpu(node_array_idx, cpu);
