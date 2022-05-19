@@ -26,12 +26,12 @@ MODULE_LICENSE("GPL");
 //#define BLOCK_IRQ
 #define NR_BENCH (5000000)
 
-#define MAX_COMBINER_OPERATIONS 3
+#define MAX_COMBINER_OPERATIONS 1
 
 #define MAX_CPU		16
 #define MAX_DELAY 	100
 
-static int max_cpus = 6;
+static int max_cpus = 14;
 static int delay_time = 0;
 static int nr_bench = 500000;
 
@@ -51,6 +51,12 @@ static int nr_bench = 500000;
 #define GET_NEXT_NODE(x, y)	(per_cpu(x, DECODE_CPU(y)) + DECODE_IDX(y))
 
 #define GVM_CACHE_BYTES		(1<<12)
+#define arch_lock_xchg(ptr, v)	__xchg_op((ptr), (v), xchg, "lock; ")
+
+static inline int atomic_lock_xchg(atomic_t *v, int new)
+{
+	return arch_lock_xchg(&v->counter, new);
+}
 typedef void* (*request_t)(void *);
 typedef int (*test_thread_t)(void *);
 
@@ -63,11 +69,11 @@ struct cc_node {
 	void* params;
 	void* ret;
 	int next;
-	atomic_t refcount;
 #ifdef DEBUG
 	int prev __attribute__((aligned(L1_CACHE_BYTES)));
 #endif
-	bool wait __attribute__((aligned(L1_CACHE_BYTES)));
+	atomic_t refcount __attribute__((aligned(L1_CACHE_BYTES)));
+	bool wait;
 	bool completed;
 };
 
@@ -151,17 +157,15 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 	/* Wait for spinning thread */
 	while (READ_ONCE(next->refcount.counter));
 
-	WRITE_ONCE(next->req, NULL);
-	WRITE_ONCE(next->params,NULL);
-	WRITE_ONCE(next->ret, NULL);
-	WRITE_ONCE(next->wait, true);
-	WRITE_ONCE(next->completed, false);
-	WRITE_ONCE(next->next, ENCODE_NEXT(NR_CPUS, 0));
+	next->req = NULL;
+	next->params = NULL;
+	next->ret = NULL;
+	next->wait = true;
+	next->completed = false;
+	next->next = ENCODE_NEXT(NR_CPUS, 0);
 	smp_wmb();
 
-	do {
-		prev_cpu = READ_ONCE(lock->counter);
-	} while(atomic_cmpxchg(lock, prev_cpu, this_cpu) != prev_cpu);
+	prev_cpu = atomic_lock_xchg(lock, this_cpu);
 #ifdef DEBUG
 	WARN(prev_cpu == this_cpu, "lockbench: prev_cpu == this_cpu, Can't be happend!!!");
 	next->prev = prev_cpu;
@@ -193,7 +197,7 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 					next->wait, next->completed);
 
 	pr_debug("lockbench: Spinning start!\n");
-	while (READ_ONCE(prev->wait))
+	while (likely(READ_ONCE(prev->wait)))
 		cpu_relax();
 
 	smp_rmb();
@@ -262,8 +266,8 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 	pending = GET_NEXT_NODE(node_array, pending_cpu);
 out:
 	smp_wmb();
-	WRITE_ONCE(pending->wait, false);
 	WRITE_ONCE(prev->refcount.counter, prev->refcount.counter-1);
+	WRITE_ONCE(pending->wait, false);
 	put_cpu();
 	pr_debug("lockbench: <Combiner thread> end of critical section!\n");
 	return prev->ret;
@@ -271,8 +275,8 @@ out:
 
 /* Dummy workload */
 DEFINE_SPINLOCK(dummy_spinlock);
-atomic_t dummy_lock = ATOMIC_INIT(0);
-int dummy_counter = 0;
+atomic_t dummy_lock __attribute__((aligned(L1_CACHE_BYTES))) = ATOMIC_INIT(0);
+int dummy_counter __attribute__((aligned(L1_CACHE_BYTES))) = 0;
 int cache_table[1024*4+1];
 void* dummy_increment(void* params)
 {
