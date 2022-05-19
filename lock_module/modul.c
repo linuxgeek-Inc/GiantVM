@@ -23,14 +23,15 @@ MODULE_AUTHOR("Wonhyuk Yang");
 MODULE_LICENSE("GPL");
 
 //#define DEBUG
-#define NR_BENCH (500000)
+//#define BLOCK_IRQ
+#define NR_BENCH (5000000)
 
-#define MAX_COMBINER_OPERATIONS 5
+#define MAX_COMBINER_OPERATIONS 3
 
 #define MAX_CPU		16
 #define MAX_DELAY 	100
 
-static int max_cpus = 2;
+static int max_cpus = 6;
 static int delay_time = 0;
 static int nr_bench = 500000;
 
@@ -39,8 +40,9 @@ static int nr_bench = 500000;
  * used alternatley. In this way, we can avoid
  * node overwrite problem.
  */
-#define INDEX_SHIFT			(1)
-#define INDEX_MASK			((1 << INDEX_SHIFT) - 1)
+#define INDEX_SHIFT			(2)
+#define INDEX_SIZE			(1<<INDEX_SHIFT)
+#define INDEX_MASK			(INDEX_SIZE - 1)
 #define ENCODE_NEXT(x, y)	((x << INDEX_SHIFT) | (y & INDEX_MASK))
 
 #define DECODE_IDX(x)		(x & INDEX_MASK)
@@ -48,6 +50,7 @@ static int nr_bench = 500000;
 
 #define GET_NEXT_NODE(x, y)	(per_cpu(x, DECODE_CPU(y)) + DECODE_IDX(y))
 
+#define GVM_CACHE_BYTES		(1<<12)
 typedef void* (*request_t)(void *);
 typedef int (*test_thread_t)(void *);
 
@@ -60,15 +63,18 @@ struct cc_node {
 	void* params;
 	void* ret;
 	int next;
+	atomic_t refcount;
 #ifdef DEBUG
 	int prev __attribute__((aligned(L1_CACHE_BYTES)));
 #endif
 	bool wait __attribute__((aligned(L1_CACHE_BYTES)));
 	bool completed;
-	atomic_t refcount;
 };
 
-DEFINE_PER_CPU(struct cc_node, node_array[2]) = {
+#ifdef DYNAMIC_PERCPU
+struct cc_node __percpu *node_array;
+#else
+DEFINE_PER_CPU(struct cc_node, node_array[INDEX_SIZE]) = {
 	{
 		.next = ENCODE_NEXT(NR_CPUS, 1),
 		.refcount = ATOMIC_INIT(0),
@@ -77,13 +83,28 @@ DEFINE_PER_CPU(struct cc_node, node_array[2]) = {
 #endif
 	},
 	{
-		.next = ENCODE_NEXT(NR_CPUS, 0),
+		.next = ENCODE_NEXT(NR_CPUS, 2),
 		.refcount = ATOMIC_INIT(0),
 #ifdef DEBUG
 		.prev = ENCODE_NEXT(NR_CPUS, 1),
 #endif
 	},
+	{
+		.next = ENCODE_NEXT(NR_CPUS, 3),
+		.refcount = ATOMIC_INIT(0),
+#ifdef DEBUG
+		.prev = ENCODE_NEXT(NR_CPUS, 2),
+#endif
+	},
+	{
+		.next = ENCODE_NEXT(NR_CPUS, 0),
+		.refcount = ATOMIC_INIT(0),
+#ifdef DEBUG
+		.prev = ENCODE_NEXT(NR_CPUS, 3),
+#endif
+	}
 };
+#endif
 
 struct lb_info {
 	request_t req;
@@ -106,8 +127,8 @@ DEFINE_PER_CPU(int, node_array_idx) = 1;
 #ifdef DEBUG
 static int node_trace[MAX_CPU*2];
 static int node_trace_idx = 0;
+#else
 #endif
-static int dump_cclock(void);
 
 void* execute_cs(request_t req, void *params, atomic_t *lock)
 {
@@ -122,14 +143,13 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 
 	/* get/update node_arra_idx */
 	int this_cpu_idx = per_cpu(node_array_idx, this_cpu);
-	per_cpu(node_array_idx, this_cpu) = this_cpu_idx? 0 : 1;
+	per_cpu(node_array_idx, this_cpu) = (this_cpu_idx) + 1 % INDEX_SIZE;
 
 	this_cpu = ENCODE_NEXT(this_cpu, this_cpu_idx);
 	next = GET_NEXT_NODE(node_array, this_cpu);
 
 	/* Wait for spinning thread */
-	while (READ_ONCE(next->refcount.counter))
-		cpu_relax();
+	while (READ_ONCE(next->refcount.counter));
 
 	WRITE_ONCE(next->req, NULL);
 	WRITE_ONCE(next->params,NULL);
@@ -142,8 +162,8 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 	do {
 		prev_cpu = READ_ONCE(lock->counter);
 	} while(atomic_cmpxchg(lock, prev_cpu, this_cpu) != prev_cpu);
-	WARN(prev_cpu == this_cpu, "lockbench: prev_cpu == this_cpu, Can't be happend!!!");
 #ifdef DEBUG
+	WARN(prev_cpu == this_cpu, "lockbench: prev_cpu == this_cpu, Can't be happend!!!");
 	next->prev = prev_cpu;
 #endif
 	prev = GET_NEXT_NODE(node_array, prev_cpu);
@@ -151,6 +171,7 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 	WRITE_ONCE(prev->req, req);
 	WRITE_ONCE(prev->params, params);
 	smp_wmb();
+#ifdef DEBUG
 	if (DECODE_CPU(prev->next)!=NR_CPUS) {
 		pr_err("prev->next's value is not NR_CPUS!!!"
 			   "prev_cpu (%d,%d) prev->next (%d,%d) this_cpu (%d,%d)",
@@ -159,6 +180,7 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 			   DECODE_CPU(this_cpu), DECODE_IDX(this_cpu));
 		dump_cclock();
 	}
+#endif
 	atomic_inc(&prev->refcount);
 	WRITE_ONCE(prev->next, this_cpu);
 
@@ -176,7 +198,7 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 
 	smp_rmb();
 	if (READ_ONCE(prev->completed)) {
-		atomic_dec(&prev->refcount);
+		WRITE_ONCE(prev->refcount.counter, prev->refcount.counter-1);
 		put_cpu();
 		pr_debug("lockbench: <Normal thread> CPU: (%d, %d) end of critical section!\n",
 						DECODE_CPU(this_cpu), DECODE_IDX(this_cpu));
@@ -186,13 +208,14 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 	/* Success to get lock */
 	pending_cpu = prev_cpu;
 
-	while (counter++ < MAX_COMBINER_OPERATIONS) {
+	while (counter++ < MAX_COMBINER_OPERATIONS*max_cpus) {
 		pending = GET_NEXT_NODE(node_array, pending_cpu);
 		cur_cpu = pending_cpu;
 		pending_cpu = READ_ONCE(pending->next);
 
 		/* Keep ordering next -> (req, params)*/
 		smp_rmb();
+#ifdef DEBUG
 		if(!(READ_ONCE(pending->wait)) && (READ_ONCE(pending->completed))) {
 			pr_err("Target node already done..."
 				   "cur_cpu: (%d,%d), wait:%d, complete: %d "
@@ -204,6 +227,7 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 				DECODE_CPU(this_cpu), DECODE_IDX(this_cpu));
 			dump_cclock();
 		}
+#endif
 
 		/* Branch prediction: which case is more profitable? */
 		if (DECODE_CPU(pending_cpu) == NR_CPUS)
@@ -220,18 +244,18 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 
 		pending_req = READ_ONCE(pending->req);
 		/* Preserve store order completed -> wait -> next */
+#ifdef DEBUG
 		WARN(pending_req == NULL, "lockbench: pending->req == NULL...");
+#endif
 		WRITE_ONCE(pending->ret, pending_req(pending->params));
 		WRITE_ONCE(pending->completed, true);
 		smp_wmb();
 		WRITE_ONCE(pending->wait, false);
-
-		/* request is done */
-		if (prev == pending)
-			atomic_dec(&prev->refcount);
 	}
 	/* Pass tho combiner thread role */
+#ifdef DEBUG
 	WARN(DECODE_CPU(pending_cpu) == NR_CPUS, "lockbench: DECODE_CPU(pedning_cpu) == NR_CPUS...");
+#endif
 	pr_debug("lockbench: pass the combiner role to CPU: (%d, %d)\n",
 					DECODE_CPU(pending_cpu), DECODE_IDX(pending_cpu));
 
@@ -239,6 +263,7 @@ void* execute_cs(request_t req, void *params, atomic_t *lock)
 out:
 	smp_wmb();
 	WRITE_ONCE(pending->wait, false);
+	WRITE_ONCE(prev->refcount.counter, prev->refcount.counter-1);
 	put_cpu();
 	pr_debug("lockbench: <Combiner thread> end of critical section!\n");
 	return prev->ret;
@@ -248,23 +273,18 @@ out:
 DEFINE_SPINLOCK(dummy_spinlock);
 atomic_t dummy_lock = ATOMIC_INIT(0);
 int dummy_counter = 0;
-int cache_table[128];
+int cache_table[1024*4+1];
 void* dummy_increment(void* params)
 {
 	int i;
 	int *counter = (int*)params;
-	if (unlikely(counter == NULL)) {
-		printk("!!!! counter: %p", (counter));
-	} else {
-		(*counter)++;
-	}
+	(*counter)++;
 
-	for (i = 0; i < 128; i++)
-		cache_table[i]++;
+	for (i = 0; i < 4; i++)
+		cache_table[i*1024]++;
 
 	if (delay_time)
 		udelay(delay_time);
-
 	return params;
 }
 
@@ -328,6 +348,7 @@ static ssize_t lb_quit(struct file *filp, const char __user *ubuf,
 {
 	unsigned long val;
 	int ret, cpu;
+	int j;
 	struct lb_info *ld;
 	struct cc_node *node;
 	ret = kstrtoul_from_user(ubuf, cnt, 10, &val);
@@ -343,10 +364,10 @@ static ssize_t lb_quit(struct file *filp, const char __user *ubuf,
 
 			smp_mb();
 			node = per_cpu(node_array, cpu);
-			node[0].wait = false;
-			node[0].completed = true;
-			node[1].wait = false;
-			node[1].completed = true;
+			for (j=0; j<INDEX_SIZE; j++) {
+				node[j].wait = false;
+				node[j].completed = true;
+			}
 		}
 		per_cpu(node_array, 0)[0].completed = false;
 	}
@@ -580,7 +601,9 @@ int test_thread(void *data)
 {
 	int i;
 	int cpu = get_cpu();
+#ifdef BLOCK_IRQ
 	unsigned long flags;
+#endif
 	struct lb_info * lb_data = &per_cpu(*((struct lb_info *)data), cpu);
 	unsigned long prev = 0, cur;
 
@@ -592,11 +615,13 @@ int test_thread(void *data)
 			printk("lockbench: <cc-lock> monitor thread %dth [%lu]\n", i, cur-prev);
 			prev = cur;
 		}
+#ifdef BLOCK_IRQ
 		local_irq_save(flags);
-		preempt_disable();
+#endif
 		execute_cs(lb_data->req, lb_data->params, lb_data->lock);
+#ifdef BLOCK_IRQ
 		local_irq_restore(flags);
-		preempt_enable();
+#endif
 	}
 
 	if (unlikely(lb_data->monitor)) {
@@ -615,7 +640,9 @@ int test_thread2(void *data)
 	int cpu = get_cpu();
 	struct lb_info * lb_data = &per_cpu(*((struct lb_info *)data), cpu);
 	unsigned long prev = 0, cur = 0;
+#ifdef BLOCK_IRQ
 	unsigned long flags;
+#endif
 	spinlock_t *lock = (spinlock_t *)lb_data->lock;
 
 	if (unlikely(lb_data->monitor))
@@ -626,9 +653,17 @@ int test_thread2(void *data)
 			printk("lockbench: <spinlock> monitor thread %dth [%lu]\n", i, cur-prev);
 			prev = cur;
 		}
+#ifdef BLOCK_IRQ
 		spin_lock_irqsave(lock, flags);
+#else
+		spin_lock(lock);
+#endif
 		lb_data->req(lb_data->params);
+#ifdef BLOCK_IRQ
 		spin_unlock_irqrestore(lock, flags);
+#else
+		spin_unlock(lock);
+#endif
 	}
 
 	if (unlikely(lb_data->monitor)) {
@@ -671,26 +706,23 @@ int prepare_tests(test_thread_t test, void *arg, const char *name)
 	}
 	return 0;
 }
-
+#ifdef DEBUG
 static int dump_cclock(void)
 {
 	int cpu, idx;
+	int j;
 	struct cc_node *node;
 	struct lb_info *ld;
-#ifdef DEBUG
 	int tmp;
-#endif
 
 	pr_err("<Node_array information>\n");
 	pr_err("dummy_lock: (%d, %d)\n",
 					DECODE_CPU(dummy_lock.counter), DECODE_IDX(dummy_lock.counter));
-#ifdef DEBUG
 	pr_err("last used node:\n");
 	for (idx=6; idx>0; idx--){
 		tmp = node_trace[(node_trace_idx + (MAX_CPU*2) - (idx)) % (MAX_CPU*2)];
 		pr_err("(%d,%d)->", DECODE_CPU(tmp), DECODE_IDX(tmp));
 	}
-#endif
 	for_each_online_cpu(cpu) {
 		node = per_cpu(node_array, cpu);
 		idx = per_cpu(node_array_idx, cpu);
@@ -699,60 +731,42 @@ static int dump_cclock(void)
 						"\treq = %pF,\n"
 						"\tparams = %p,\n"
 						"\twait = %d, completed = %d,\n"
-#ifdef DEBUG
 						"\trefcount = %d,\n"
 						"\tNext (%d, %d)\n"
 						"\tPrev (%d, %d)\n}\n",
-#else
-						"\tNext (%d, %d)\n",
-#endif
 						cpu, 0,
 						node[0].req, node[0].params,
 						node[0].wait, node[0].completed,
-#ifdef DEBUG
 						node[0].refcount.counter,
 						DECODE_CPU(node[0].next),
 						DECODE_IDX(node[0].next),
 						DECODE_CPU(node[0].prev),
 						DECODE_IDX(node[0].prev)
-#else
-						DECODE_CPU(node[0].next),
-						DECODE_IDX(node[0].next)
-#endif
 						);
 		pr_err("Node(%d, %d) {\n"
 						"\treq = %pF,\n"
 						"\tparams = %p,\n"
 						"\twait = %d, completed = %d,\n"
-#ifdef DEBUG
 						"\trefcount = %d,\n"
 						"\tNext (%d, %d)\n"
 						"\tPrev (%d, %d)\n}\n",
-#else
-						"\tNext (%d, %d)\n",
-#endif
 						cpu, 1,
 						node[1].req, node[1].params,
 						node[1].wait, node[1].completed,
-#ifdef DEBUG
 						node[1].refcount.counter,
 						DECODE_CPU(node[1].next),
 						DECODE_IDX(node[1].next),
 						DECODE_CPU(node[1].prev),
 						DECODE_IDX(node[1].prev)
-#else
-						DECODE_CPU(node[1].next),
-						DECODE_IDX(node[1].next)
-#endif
 						);
 		ld = &per_cpu(lb_info_array, cpu);
 		ld->quit = true;
 
 		smp_mb();
-		node[0].wait = false;
-		node[0].completed = true;
-		node[1].wait = false;
-		node[1].completed = true;
+		for (j=0; j<INDEX_SIZE; j++) {
+			node[j].wait = false;
+			node[j].completed = true;
+		}
 	}
 	dummy_lock.counter = ENCODE_NEXT(0, 0);
 	per_cpu(node_array, 0)[0].completed = false;
@@ -760,17 +774,21 @@ static int dump_cclock(void)
 	BUG();
 	return 0;
 }
-
+#endif
 /* module init/exit */
 static int lock_benchmark_init(void)
 {
 	lb_debugfs_init();
+#ifdef DYNAMIC_PERCPU
+	node_array = (struct cc_node *)alloc_percpu(struct cc_node[INDEX_SIZE]);
+#endif
 	return 0;
 }
 
 static void lock_benchmark_exit(void)
 {
 	int cpu;
+	int j;
 	struct lb_info *ld;
 	struct cc_node *node;
 
@@ -780,14 +798,16 @@ static void lock_benchmark_exit(void)
 
 		smp_mb();
 		node = per_cpu(node_array, cpu);
-		node[0].wait = false;
-		node[0].completed = true;
-		node[1].wait = false;
-		node[1].completed = true;
+		for (j=0; j<INDEX_SIZE; j++) {
+			node[j].wait = false;
+			node[j].completed = true;
+		}
 	}
+#ifdef DYNAMIC_PERCPU
+	if (!node_array)
+		free_percpu(node_array);
+#endif
 	lb_debugfs_exit();
 }
-
 module_init(lock_benchmark_init);
 module_exit(lock_benchmark_exit);
-
