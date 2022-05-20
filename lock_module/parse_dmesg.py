@@ -1,12 +1,14 @@
 import subprocess
+import psutil
 
+clk = 1 / psutil.cpu_freq().current
 cc_lock = {"name":"cc_lock  ", "nr":0, "time":list()}
 spin_lock = {"name":"spin_lock", "nr":0, "time":list()}
 
 def print_stat(target):
     avg = sum(target["time"]) / target["nr"]
-    print("[{0}] average time: {1:15.5f}, nr: {2}".format(target["name"],
-            avg, target["nr"]))
+    print("[{0}] average clock: {1:15.5f}, nr: {2}".format(target["name"],
+            avg/clk, target["nr"]))
     return avg
 
 if __name__ == "__main__":
@@ -22,7 +24,7 @@ if __name__ == "__main__":
         if target is None:
             continue
 
-        target["nr"] += 1
+        target["nr"] += 1000
         target["time"].append(int(line[line.rfind("[")+1:-1]))
 
     cc_avg = print_stat(cc_lock)
