@@ -8,5 +8,5 @@ sleep 8
 echo 2 > $LOCK_PATH/trigger
 sleep 8
 echo "CPU:$CPU" >> result
-python3 parse_dmesg.py >> result
+python3 parse_dmesg.py $1 >> result
 
